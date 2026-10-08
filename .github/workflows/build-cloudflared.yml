@@ -1,0 +1,71 @@
+name: Build patched cloudflared
+
+on:
+  push:
+    paths:
+      - 'cloudflared/**'
+      - '.github/workflows/build-cloudflared.yml'
+  pull_request:
+    paths:
+      - 'cloudflared/**'
+      - '.github/workflows/build-cloudflared.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloudflared-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOTOOLCHAIN: local
+  GOCACHE: ${{ github.workspace }}/.cache/go/build
+  GOMODCACHE: ${{ github.workspace }}/.cache/go/mod
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Fetch pinned upstream and apply patch
+        run: bash cloudflared/scripts/prepare-source.sh .build/cloudflared
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: cloudflared/go-version
+          cache-dependency-path: .build/cloudflared/go.sum
+      - name: Test proxy routing and affected packages
+        run: bash cloudflared/scripts/test.sh .build/cloudflared
+
+  build:
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Fetch pinned upstream and apply patch
+        run: bash cloudflared/scripts/prepare-source.sh .build/cloudflared
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: cloudflared/go-version
+          cache-dependency-path: .build/cloudflared/go.sum
+      - name: Build binary archives and Debian packages
+        env:
+          TARGET_ARCH: ${{ matrix.arch }}
+        run: bash cloudflared/scripts/build.sh .build/cloudflared "$TARGET_ARCH" dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: cloudflared-linux-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30

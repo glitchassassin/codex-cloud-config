@@ -1,0 +1,19 @@
+# Rendered by configure-volume.sh. Keep the listener on the node's tailnet IP.
+http_port @RELAY_TAILNET_IP@:3128
+visible_hostname cloudflare-relay
+cache_effective_user _daemon_
+max_filedescriptors 1024
+
+acl tunnel_connect method CONNECT
+acl tunnel_port port 7844
+
+# Global Cloudflare tunnel edge IPv4 addresses, verified 2026-10-08.
+# https://developers.cloudflare.com/tunnel/configuration/#firewall-rules
+acl cf_edges dst 198.41.192.167 198.41.192.67 198.41.192.57 198.41.192.107 198.41.192.27
+acl cf_edges dst 198.41.192.7 198.41.192.227 198.41.192.47 198.41.192.37 198.41.192.77
+acl cf_edges dst 198.41.200.13 198.41.200.193 198.41.200.33 198.41.200.233 198.41.200.53
+acl cf_edges dst 198.41.200.63 198.41.200.113 198.41.200.73 198.41.200.43 198.41.200.23
+
+http_access allow tunnel_connect tunnel_port cf_edges
+http_access deny all
+cache deny all

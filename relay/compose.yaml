@@ -1,0 +1,12 @@
+services:
+  relay:
+    image: ubuntu/squid:7.2-26.04_edge
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - squid_config:/etc/squid:ro
+
+volumes:
+  squid_config:
+    external: true
+    name: cloudflare-relay-config

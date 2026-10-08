@@ -1,0 +1,714 @@
+diff --git a/cmd/cloudflared/flags/flags.go b/cmd/cloudflared/flags/flags.go
+index a792bc8..317e52f 100644
+--- a/cmd/cloudflared/flags/flags.go
++++ b/cmd/cloudflared/flags/flags.go
+@@ -84,6 +84,9 @@ const (
+ 	// EdgeBindAddress is the command line flag to bind to IP address for outgoing connections to Cloudflare Edge
+ 	EdgeBindAddress = "edge-bind-address"
+ 
++	// EdgeProxyChain is an ordered, comma-separated list of HTTP CONNECT proxies.
++	EdgeProxyChain = "edge-proxy-chain"
++
+ 	// CACert Certificate Authority authenticating connections with Cloudflare's edge network.
+ 	CACert = "cacert"
+ 
+diff --git a/cmd/cloudflared/tunnel/cmd.go b/cmd/cloudflared/tunnel/cmd.go
+index 30a4862..a606ad4 100644
+--- a/cmd/cloudflared/tunnel/cmd.go
++++ b/cmd/cloudflared/tunnel/cmd.go
+@@ -121,6 +121,7 @@ var (
+ 		cfdflags.Region,
+ 		cfdflags.EdgeIpVersion,
+ 		cfdflags.EdgeBindAddress,
++		cfdflags.EdgeProxyChain,
+ 		"cacert",
+ 		"hostname",
+ 		"id",
+@@ -424,7 +425,7 @@ func StartServer(
+ 	// Run connectivity pre-checks for cloudflared. This runs in a separate
+ 	// goroutine, as we want to keep initializing cloudflared while prechecks
+ 	// are running. Prechecks are controlled via DNS flag for remote kill-switch capability.
+-	if !tunnelConfig.ClientConfig.ConnectionFeaturesSnapshot().SkipPrechecks && !c.Bool(cfdflags.NoPrechecks) {
++	if tunnelConfig.EdgeProxyChain == nil && !tunnelConfig.ClientConfig.ConnectionFeaturesSnapshot().SkipPrechecks && !c.Bool(cfdflags.NoPrechecks) {
+ 		go runPrechecks(c, log, tunnelConfig.Region, tunnelConfig.ClientConfig.ConnectionFeaturesSnapshot().PostQuantum)
+ 	}
+ 
+@@ -662,6 +663,7 @@ func tunnelFlags(shouldHide bool) []cli.Flag {
+ 	flags = append(flags, proxydns.ConfigureProxyDNSFlags(shouldHide)...) // removed feature, only kept to not break any script that might be setting these flags
+ 	flags = append(flags, []cli.Flag{
+ 		credentialsFileFlag,
++		edgeProxyChainFlag,
+ 		altsrc.NewBoolFlag(&cli.BoolFlag{
+ 			Name:   cfdflags.IsAutoUpdated,
+ 			Usage:  "Signal the new process that Cloudflare Tunnel connector has been autoupdated",
+diff --git a/cmd/cloudflared/tunnel/configuration.go b/cmd/cloudflared/tunnel/configuration.go
+index e9c5a25..9702f9c 100644
+--- a/cmd/cloudflared/tunnel/configuration.go
++++ b/cmd/cloudflared/tunnel/configuration.go
+@@ -23,6 +23,7 @@ import (
+ 	"github.com/cloudflare/cloudflared/config"
+ 	"github.com/cloudflare/cloudflared/connection"
+ 	"github.com/cloudflare/cloudflared/edgediscovery/allregions"
++	"github.com/cloudflare/cloudflared/edgeproxy"
+ 	"github.com/cloudflare/cloudflared/features"
+ 	"github.com/cloudflare/cloudflared/ingress"
+ 	"github.com/cloudflare/cloudflared/ingress/origins"
+@@ -42,8 +43,9 @@ var (
+ 		credentialsContentsFlag.Name,
+ 		tunnelTokenFlag.Name,
+ 		flags.AllowedMail,
++		flags.EdgeProxyChain,
+ 	}
+-	secretEnvFlags = [...](*altsrc.StringFlag){credentialsContentsFlag, tunnelTokenFlag}
++	secretEnvFlags = [...](*altsrc.StringFlag){credentialsContentsFlag, tunnelTokenFlag, edgeProxyChainFlag}
+ 
+ 	configFlags = []string{
+ 		flags.AutoUpdateFreq,
+@@ -122,7 +124,10 @@ func prepareTunnelConfig(
+ 	observer *connection.Observer,
+ 	namedTunnel *connection.TunnelProperties,
+ ) (*supervisor.TunnelConfig, *orchestration.Config, error) {
+-	transportProtocol := c.String(flags.Protocol)
++	edgeProxyChain, transportProtocol, err := edgeProxySettings(c)
++	if err != nil {
++		return nil, nil, err
++	}
+ 	isPostQuantumEnforced := c.Bool(flags.PostQuantum)
+ 	featureSelector, err := features.NewFeatureSelector(ctx, namedTunnel.Credentials.AccountTag, c.StringSlice(flags.Features), isPostQuantumEnforced, log)
+ 	if err != nil {
+@@ -234,6 +239,7 @@ func prepareTunnelConfig(
+ 		Region:          resolvedRegion,
+ 		EdgeIPVersion:   edgeIPVersion,
+ 		EdgeBindAddr:    edgeBindAddr,
++		EdgeProxyChain:  edgeProxyChain,
+ 		HAConnections:   c.Int(flags.HaConnections),
+ 		IsAutoupdated:   c.Bool(flags.IsAutoUpdated),
+ 		LBPool:          c.String(flags.LBPool),
+@@ -273,6 +279,24 @@ func prepareTunnelConfig(
+ 	return tunnelConfig, orchestratorConfig, nil
+ }
+ 
++// edgeProxySettings validates the proxy route before any edge connections.
++func edgeProxySettings(c *cli.Context) (*edgeproxy.Chain, string, error) {
++	chain, err := edgeproxy.ParseChain(c.String(flags.EdgeProxyChain))
++	if err != nil {
++		return nil, "", err
++	}
++	protocol := c.String(flags.Protocol)
++	if chain != nil {
++		if protocol == connection.AutoSelectFlag {
++			protocol = connection.HTTP2.String()
++		}
++		if protocol != connection.HTTP2.String() {
++			return nil, "", fmt.Errorf("edge-proxy-chain requires --protocol http2 (or auto); UDP/QUIC cannot use CONNECT")
++		}
++	}
++	return chain, protocol, nil
++}
++
+ func parseConfigFlags(c *cli.Context) map[string]string {
+ 	result := make(map[string]string)
+ 
+diff --git a/cmd/cloudflared/tunnel/edge_proxy_test.go b/cmd/cloudflared/tunnel/edge_proxy_test.go
+new file mode 100644
+index 0000000..60d1098
+--- /dev/null
++++ b/cmd/cloudflared/tunnel/edge_proxy_test.go
+@@ -0,0 +1,91 @@
++package tunnel
++
++import (
++	"flag"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"os/exec"
++	"strings"
++	"testing"
++
++	"github.com/rs/zerolog"
++	"github.com/stretchr/testify/require"
++	"github.com/urfave/cli/v2"
++
++	"github.com/cloudflare/cloudflared/cmd/cloudflared/cliutil"
++	"github.com/cloudflare/cloudflared/cmd/cloudflared/flags"
++)
++
++func TestEdgeProxyProtocolSelection(t *testing.T) {
++	t.Parallel()
++	for _, test := range []struct {
++		name     string
++		chain    string
++		protocol string
++		want     string
++		wantErr  bool
++	}{
++		{"direct auto", "", "auto", "auto", false},
++		{"direct quic", "", "quic", "quic", false},
++		{"proxy auto", "http://proxy:8088", "auto", "http2", false},
++		{"proxy http2", "http://proxy:8088", "http2", "http2", false},
++		{"proxy quic", "http://proxy:8088", "quic", "", true},
++		{"invalid proxy", "https://proxy:8088", "http2", "", true},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			t.Parallel()
++			set := flag.NewFlagSet("proxy-test", flag.ContinueOnError)
++			set.String(flags.EdgeProxyChain, test.chain, "")
++			set.String(flags.Protocol, test.protocol, "")
++			_, protocol, err := edgeProxySettings(cli.NewContext(cli.NewApp(), set, nil))
++			if test.wantErr {
++				require.Error(t, err)
++				return
++			}
++			require.NoError(t, err)
++			require.Equal(t, test.want, protocol)
++		})
++	}
++}
++
++// A child process isolates net/http's cached environment proxy configuration.
++// The fake provisioning hostname must reach the proxy without local DNS or a
++// direct connection, and receives a deliberate rejection before starting a tunnel.
++func TestQuickTunnelUsesEnvironmentProxy(t *testing.T) {
++	if os.Getenv("CLOUDFLARED_PROXY_TEST_CHILD") == "1" {
++		buildInfo = cliutil.GetBuildInfo("", "proxy-test")
++		set := flag.NewFlagSet("quick-test", flag.ContinueOnError)
++		set.String(flags.EdgeProxyChain, "", "")
++		set.String(flags.Protocol, "auto", "")
++		set.String("quick-service", "http://provisioning.invalid", "")
++		context := cli.NewContext(cli.NewApp(), set, nil)
++		log := zerolog.New(io.Discard)
++		err := RunQuickTunnel(&subcommandContext{c: context, log: &log})
++		require.ErrorContains(t, err, "fixture proxy reached")
++		return
++	}
++	t.Parallel()
++	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
++		if request.Method != http.MethodPost || request.URL.String() != "http://provisioning.invalid/tunnel" {
++			t.Errorf("unexpected provisioning request: %s %s", request.Method, request.URL)
++		}
++		w.Header().Set("Content-Type", "application/json")
++		w.WriteHeader(http.StatusBadRequest)
++		_, _ = io.WriteString(w, `{"success":false,"errors":[{"code":1,"message":"fixture proxy reached"}]}`)
++	}))
++	defer proxy.Close()
++	command := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestQuickTunnelUsesEnvironmentProxy$")
++	for _, entry := range os.Environ() {
++		name, _, _ := strings.Cut(entry, "=")
++		switch strings.ToUpper(name) {
++		case "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "CLOUDFLARED_PROXY_TEST_CHILD":
++			continue
++		}
++		command.Env = append(command.Env, entry)
++	}
++	command.Env = append(command.Env, "HTTP_PROXY="+proxy.URL, "NO_PROXY=", "CLOUDFLARED_PROXY_TEST_CHILD=1")
++	output, err := command.CombinedOutput()
++	require.NoError(t, err, "%s", output)
++}
+diff --git a/cmd/cloudflared/tunnel/quick_tunnel.go b/cmd/cloudflared/tunnel/quick_tunnel.go
+index 805b2ba..ac1bd81 100644
+--- a/cmd/cloudflared/tunnel/quick_tunnel.go
++++ b/cmd/cloudflared/tunnel/quick_tunnel.go
+@@ -115,6 +115,9 @@ func quickTunnelStartupLines(
+ // We use this to power quick tunnels on trycloudflare.com, but the
+ // service is open-source and could be used by anyone.
+ func RunQuickTunnel(sc *subcommandContext) error {
++	if _, _, err := edgeProxySettings(sc.c); err != nil {
++		return err
++	}
+ 	sc.log.Info().Msg(disclaimer)
+ 	sc.log.Info().Msg("Requesting new quick Tunnel on trycloudflare.com...")
+ 
+@@ -136,6 +139,7 @@ func RunQuickTunnel(sc *subcommandContext) error {
+ 
+ 	client := http.Client{
+ 		Transport: &http.Transport{
++			Proxy:                 http.ProxyFromEnvironment,
+ 			TLSHandshakeTimeout:   httpTimeout,
+ 			ResponseHeaderTimeout: httpTimeout,
+ 		},
+@@ -214,7 +218,7 @@ func RunQuickTunnel(sc *subcommandContext) error {
+ 	quickTunnelURL := normalizeQuickTunnelURL(data.Result.Hostname)
+ 	cliutil.LogTable(sc.log, quickTunnelStartupLines(isProtected, quickTunnelURL, localOrigin, recipientPolicy))
+ 
+-	if !sc.c.IsSet(flags.Protocol) {
++	if !sc.c.IsSet(flags.Protocol) && sc.c.String(flags.EdgeProxyChain) == "" {
+ 		_ = sc.c.Set(flags.Protocol, "quic")
+ 	}
+ 
+diff --git a/cmd/cloudflared/tunnel/subcommands.go b/cmd/cloudflared/tunnel/subcommands.go
+index 2dc17f5..850c89c 100644
+--- a/cmd/cloudflared/tunnel/subcommands.go
++++ b/cmd/cloudflared/tunnel/subcommands.go
+@@ -142,6 +142,11 @@ var (
+ 			" It is not possible to delete tunnels that have connections or non-deleted dependencies, without this flag.",
+ 		EnvVars: []string{"TUNNEL_RUN_FORCE_OVERWRITE"},
+ 	}
++	edgeProxyChainFlag = altsrc.NewStringFlag(&cli.StringFlag{
++		Name:    flags.EdgeProxyChain,
++		Usage:   "Ordered comma-separated http://host:port CONNECT proxies for edge connections; requires HTTP/2.",
++		EnvVars: []string{"TUNNEL_EDGE_PROXY_CHAIN"},
++	})
+ 	selectProtocolFlag = altsrc.NewStringFlag(&cli.StringFlag{
+ 		Name:    flags.Protocol,
+ 		Value:   connection.AutoSelectFlag,
+@@ -720,6 +725,7 @@ func buildRunCommand() *cli.Command {
+ 		credentialsContentsFlag,
+ 		postQuantumFlag,
+ 		selectProtocolFlag,
++		edgeProxyChainFlag,
+ 		featuresFlag,
+ 		tunnelTokenFlag,
+ 		tunnelTokenFileFlag,
+diff --git a/edgediscovery/dial.go b/edgediscovery/dial.go
+index 1bbf59c..7980294 100644
+--- a/edgediscovery/dial.go
++++ b/edgediscovery/dial.go
+@@ -7,6 +7,8 @@ import (
+ 	"time"
+ 
+ 	"github.com/pkg/errors"
++
++	"github.com/cloudflare/cloudflared/edgeproxy"
+ )
+ 
+ // DialEdge makes a TLS connection to a Cloudflare edge node
+@@ -16,6 +18,19 @@ func DialEdge(
+ 	tlsConfig *tls.Config,
+ 	edgeTCPAddr *net.TCPAddr,
+ 	localIP net.IP,
++) (net.Conn, error) {
++	return DialEdgeWithProxy(ctx, timeout, tlsConfig, edgeTCPAddr, localIP, nil)
++}
++
++// DialEdgeWithProxy establishes the original edge TLS session over CONNECT hops.
++// A nil chain preserves the direct connection path.
++func DialEdgeWithProxy(
++	ctx context.Context,
++	timeout time.Duration,
++	tlsConfig *tls.Config,
++	edgeTCPAddr *net.TCPAddr,
++	localIP net.IP,
++	chain *edgeproxy.Chain,
+ ) (net.Conn, error) {
+ 	// Inherit from parent context so we can cancel (Ctrl-C) while dialing
+ 	dialCtx, dialCancel := context.WithTimeout(ctx, timeout)
+@@ -25,19 +40,21 @@ func DialEdge(
+ 	if localIP != nil {
+ 		dialer.LocalAddr = &net.TCPAddr{IP: localIP, Port: 0}
+ 	}
+-	edgeConn, err := dialer.DialContext(dialCtx, "tcp", edgeTCPAddr.String())
++	edgeConn, err := chain.DialContext(dialCtx, &dialer, edgeTCPAddr.String())
+ 	if err != nil {
+ 		return nil, newDialError(err, "DialContext error")
+ 	}
+ 
+ 	tlsEdgeConn := tls.Client(edgeConn, tlsConfig)
+-	tlsEdgeConn.SetDeadline(time.Now().Add(timeout))
+-
+-	if err = tlsEdgeConn.Handshake(); err != nil {
++	if err = tlsEdgeConn.HandshakeContext(dialCtx); err != nil {
++		_ = tlsEdgeConn.Close()
+ 		return nil, newDialError(err, "TLS handshake with edge error")
+ 	}
+ 	// clear the deadline on the conn; http2 has its own timeouts
+-	tlsEdgeConn.SetDeadline(time.Time{})
++	if err = tlsEdgeConn.SetDeadline(time.Time{}); err != nil {
++		_ = tlsEdgeConn.Close()
++		return nil, newDialError(err, "clear edge TLS deadline error")
++	}
+ 	return tlsEdgeConn, nil
+ }
+ 
+diff --git a/edgeproxy/chain.go b/edgeproxy/chain.go
+new file mode 100644
+index 0000000..5f0e680
+--- /dev/null
++++ b/edgeproxy/chain.go
+@@ -0,0 +1,130 @@
++// Package edgeproxy connects to tunnel edges through explicit HTTP CONNECT hops.
++package edgeproxy
++
++import (
++	"bufio"
++	"context"
++	"fmt"
++	"net"
++	"net/http"
++	"net/url"
++	"strconv"
++	"strings"
++	"time"
++)
++
++// Chain is an immutable ordered list of HTTP CONNECT proxy authorities.
++// It is safe to share between concurrent edge connection attempts.
++type Chain struct {
++	hops []string
++}
++
++// ParseChain accepts comma-separated http://host:port URLs, in dialing order.
++// Authentication and HTTPS proxy listeners are deliberately unsupported. The
++// relay is authenticated by tailnet policy; the edge retains its original TLS.
++func ParseChain(value string) (*Chain, error) {
++	if value == "" {
++		return nil, nil
++	}
++	chain := &Chain{}
++	for index, part := range strings.Split(value, ",") {
++		proxy, err := url.Parse(strings.TrimSpace(part))
++		if err != nil {
++			return nil, fmt.Errorf("invalid edge proxy URL at hop %d", index+1)
++		}
++		if proxy.Scheme != "http" || proxy.Hostname() == "" || proxy.Port() == "" ||
++			proxy.User != nil || proxy.Path != "" || proxy.RawQuery != "" ||
++			proxy.ForceQuery || proxy.Fragment != "" || proxy.Opaque != "" {
++			return nil, fmt.Errorf("edge proxy hop %d must be an http://host:port URL without credentials, path, query, or fragment", index+1)
++		}
++		port, err := strconv.Atoi(proxy.Port())
++		if err != nil || port < 1 || port > 65535 {
++			return nil, fmt.Errorf("invalid edge proxy port at hop %d", index+1)
++		}
++		chain.hops = append(chain.hops, proxy.Host)
++	}
++	return chain, nil
++}
++
++// DialContext dials the first proxy, tunnels to each subsequent proxy, then
++// tunnels to address. Errors never fall back to a direct connection.
++func (c *Chain) DialContext(ctx context.Context, dialer *net.Dialer, address string) (result net.Conn, err error) {
++	if c == nil {
++		return dialer.DialContext(ctx, "tcp", address)
++	}
++	if len(c.hops) == 0 {
++		return nil, fmt.Errorf("edge proxy chain has no hops")
++	}
++	conn, err := dialer.DialContext(ctx, "tcp", c.hops[0])
++	if err != nil {
++		return nil, fmt.Errorf("dial edge proxy hop 1: %w", err)
++	}
++	// Deadlines handle timeouts; cancellation also closes a stalled CONNECT.
++	stopCancellation := context.AfterFunc(ctx, func() { _ = conn.Close() })
++	defer stopCancellation()
++	defer func() {
++		if err != nil {
++			_ = conn.Close()
++		}
++	}()
++	if deadline, ok := ctx.Deadline(); ok {
++		if err = conn.SetDeadline(deadline); err != nil {
++			return nil, fmt.Errorf("set edge proxy deadline: %w", err)
++		}
++	}
++	current := conn
++	for index := range c.hops {
++		target := address
++		if index+1 < len(c.hops) {
++			target = c.hops[index+1]
++		}
++		current, err = connect(current, target)
++		if err != nil {
++			if ctx.Err() != nil {
++				err = ctx.Err()
++			}
++			return nil, fmt.Errorf("edge proxy hop %d CONNECT failed: %w", index+1, err)
++		}
++	}
++	if err = ctx.Err(); err != nil {
++		return nil, err
++	}
++	if err = conn.SetDeadline(time.Time{}); err != nil {
++		return nil, fmt.Errorf("clear edge proxy deadline: %w", err)
++	}
++	return current, nil
++}
++
++func connect(conn net.Conn, address string) (net.Conn, error) {
++	request := &http.Request{
++		Method: http.MethodConnect,
++		URL:    &url.URL{Host: address},
++		Host:   address,
++		Header: make(http.Header),
++	}
++	if err := request.Write(conn); err != nil {
++		return nil, fmt.Errorf("write CONNECT request: %w", err)
++	}
++	reader := bufio.NewReader(conn)
++	response, err := http.ReadResponse(reader, request) //nolint:bodyclose // CONNECT transfers socket ownership; the caller closes it on rejection.
++	if err != nil {
++		return nil, fmt.Errorf("read CONNECT response: %w", err)
++	}
++	if response.StatusCode != http.StatusOK {
++		// The caller closes the socket. Reading or closing a rejection body can
++		// otherwise block, and its contents may contain private information.
++		return nil, fmt.Errorf("proxy returned HTTP %d", response.StatusCode)
++	}
++	// Do not close a successful CONNECT response body: the socket is the tunnel.
++	// Preserve any tunnel bytes read ahead while parsing the HTTP headers.
++	return &bufferedConn{Conn: conn, reader: reader}, nil
++}
++
++type bufferedConn struct {
++	net.Conn
++	reader *bufio.Reader
++}
++
++func (c *bufferedConn) Read(buffer []byte) (int, error) {
++	return c.reader.Read(buffer)
++}
+diff --git a/edgeproxy/chain_test.go b/edgeproxy/chain_test.go
+new file mode 100644
+index 0000000..32207c4
+--- /dev/null
++++ b/edgeproxy/chain_test.go
+@@ -0,0 +1,220 @@
++package edgeproxy_test
++
++import (
++	"bufio"
++	"context"
++	"crypto/tls"
++	"crypto/x509"
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++
++	cfdcrypto "github.com/cloudflare/cloudflared/crypto"
++	"github.com/cloudflare/cloudflared/edgediscovery"
++	"github.com/cloudflare/cloudflared/edgeproxy"
++	"github.com/cloudflare/cloudflared/features"
++)
++
++func TestParseChain(t *testing.T) {
++	t.Parallel()
++	for _, value := range []string{
++		"", "http://proxy:8088", "http://proxy:8088,http://100.100.100.100:3128", "http://[::1]:3128",
++	} {
++		t.Run(value, func(t *testing.T) {
++			t.Parallel()
++			_, err := edgeproxy.ParseChain(value)
++			require.NoError(t, err)
++		})
++	}
++	for _, value := range []string{
++		" ", "https://proxy:443", "http://proxy", "http://proxy:0", "http://proxy:65536",
++		"http://proxy:8088/route", "http://proxy:8088?token=secret", "http://proxy:8088#fragment",
++		"http://user:secret@proxy:8088", "http://proxy:8088,", "http://proxy:8088,http://bad:%",
++	} {
++		t.Run(value, func(t *testing.T) {
++			t.Parallel()
++			_, err := edgeproxy.ParseChain(value)
++			require.Error(t, err)
++			require.NotContains(t, err.Error(), "secret")
++		})
++	}
++}
++
++// connectProxy forwards an authorized loopback target, modeling both the runtime
++// sidecar and the tailnet Squid relay without accessing any external service.
++func connectProxy(t *testing.T, target string) *httptest.Server {
++	t.Helper()
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
++		if request.Method != http.MethodConnect || request.Host != target {
++			t.Errorf("unexpected proxy request: %s %s", request.Method, request.Host)
++			w.WriteHeader(http.StatusForbidden)
++			return
++		}
++		upstream, err := net.DialTimeout("tcp", target, time.Second)
++		if err != nil {
++			t.Errorf("connect to fixture: %v", err)
++			w.WriteHeader(http.StatusBadGateway)
++			return
++		}
++		defer func() { _ = upstream.Close() }()
++		conn, buffered, err := w.(http.Hijacker).Hijack()
++		if err != nil {
++			t.Errorf("hijack proxy connection: %v", err)
++			return
++		}
++		defer func() { _ = conn.Close() }()
++		if _, err := io.WriteString(conn, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
++			return
++		}
++		copied := make(chan struct{})
++		go func() {
++			_, _ = io.Copy(upstream, buffered.Reader)
++			_ = upstream.Close()
++			close(copied)
++		}()
++		_, _ = io.Copy(conn, upstream)
++		_ = conn.Close()
++		<-copied
++	}))
++	t.Cleanup(server.Close)
++	return server
++}
++
++func TestTwoHopsPreserveTLSIdentityAndData(t *testing.T) {
++	t.Parallel()
++	edge := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		_, _ = io.WriteString(w, "reached edge")
++	}))
++	defer edge.Close()
++	target := strings.TrimPrefix(edge.URL, "https://")
++	relay := connectProxy(t, target)
++	sidecar := connectProxy(t, strings.TrimPrefix(relay.URL, "http://"))
++	chain, err := edgeproxy.ParseChain(sidecar.URL + "," + relay.URL)
++	require.NoError(t, err)
++	address, err := net.ResolveTCPAddr("tcp", target)
++	require.NoError(t, err)
++	roots := x509.NewCertPool()
++	roots.AddCert(edge.Certificate())
++	tlsConfig, err := cfdcrypto.TLSConfigWithCurvePreferences(
++		&tls.Config{RootCAs: roots, ServerName: "example.com", MinVersion: tls.VersionTLS12},
++		features.PostQuantumPrefer)
++	require.NoError(t, err)
++	conn, err := edgediscovery.DialEdgeWithProxy(t.Context(), 3*time.Second,
++		tlsConfig, address, nil, chain)
++	require.NoError(t, err)
++	defer func() { _ = conn.Close() }()
++	state := conn.(*tls.Conn).ConnectionState()
++	require.Equal(t, "example.com", state.ServerName)
++	require.NotEmpty(t, state.VerifiedChains)
++	_, err = fmt.Fprintf(conn, "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
++	require.NoError(t, err)
++	response, err := http.ReadResponse(bufio.NewReader(conn), nil)
++	require.NoError(t, err)
++	defer func() { _ = response.Body.Close() }()
++	body, err := io.ReadAll(response.Body)
++	require.NoError(t, err)
++	require.Equal(t, "reached edge", string(body))
++}
++
++func TestProxyDoesNotDisableCertificateVerification(t *testing.T) {
++	t.Parallel()
++	edge := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
++	defer edge.Close()
++	target := strings.TrimPrefix(edge.URL, "https://")
++	relay := connectProxy(t, target)
++	chain, err := edgeproxy.ParseChain(relay.URL)
++	require.NoError(t, err)
++	address, err := net.ResolveTCPAddr("tcp", target)
++	require.NoError(t, err)
++	roots := x509.NewCertPool()
++	roots.AddCert(edge.Certificate())
++	conn, err := edgediscovery.DialEdgeWithProxy(t.Context(), 3*time.Second,
++		&tls.Config{RootCAs: roots, ServerName: "wrong.invalid", MinVersion: tls.VersionTLS12}, address, nil, chain)
++	require.ErrorContains(t, err, "certificate")
++	require.Nil(t, conn)
++}
++
++func TestCONNECTPreservesReadAheadBytes(t *testing.T) {
++	t.Parallel()
++	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		conn, _, err := w.(http.Hijacker).Hijack()
++		if err != nil {
++			t.Errorf("hijack: %v", err)
++			return
++		}
++		defer func() { _ = conn.Close() }()
++		_, _ = io.WriteString(conn, "HTTP/1.1 200 OK\r\n\r\nfirst tunnel bytes")
++	}))
++	defer proxy.Close()
++	chain, err := edgeproxy.ParseChain(proxy.URL)
++	require.NoError(t, err)
++	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
++	defer cancel()
++	conn, err := chain.DialContext(ctx, &net.Dialer{}, "example.invalid:7844")
++	require.NoError(t, err)
++	defer func() { _ = conn.Close() }()
++	body, err := io.ReadAll(conn)
++	require.NoError(t, err)
++	require.Equal(t, "first tunnel bytes", string(body))
++}
++
++func TestRejectedCONNECTDoesNotFallBackToDirect(t *testing.T) {
++	t.Parallel()
++	direct := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		t.Error("proxy rejection must not reach the edge directly")
++		w.WriteHeader(http.StatusOK)
++	}))
++	defer direct.Close()
++	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		w.WriteHeader(http.StatusForbidden)
++	}))
++	defer proxy.Close()
++	chain, err := edgeproxy.ParseChain(proxy.URL)
++	require.NoError(t, err)
++	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
++	defer cancel()
++	conn, err := chain.DialContext(ctx, &net.Dialer{}, strings.TrimPrefix(direct.URL, "http://"))
++	require.ErrorContains(t, err, "HTTP 403")
++	require.Nil(t, conn)
++}
++
++func TestCancelledCONNECTClosesSocket(t *testing.T) {
++	t.Parallel()
++	requested := make(chan struct{})
++	closed := make(chan struct{})
++	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		conn, _, err := w.(http.Hijacker).Hijack()
++		if err != nil {
++			t.Errorf("hijack: %v", err)
++			return
++		}
++		defer func() { _ = conn.Close() }()
++		close(requested)
++		_, _ = io.Copy(io.Discard, conn)
++		close(closed)
++	}))
++	defer proxy.Close()
++	chain, err := edgeproxy.ParseChain(proxy.URL)
++	require.NoError(t, err)
++	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
++	defer cancel()
++	go func() {
++		<-requested
++		cancel()
++	}()
++	conn, err := chain.DialContext(ctx, &net.Dialer{}, "example.invalid:7844")
++	require.ErrorIs(t, err, context.Canceled)
++	require.Nil(t, conn)
++	select {
++	case <-closed:
++	case <-time.After(3 * time.Second):
++		t.Fatal("cancelled CONNECT leaked its socket")
++	}
++}
+diff --git a/supervisor/tunnel.go b/supervisor/tunnel.go
+index 01cca57..6ee318c 100644
+--- a/supervisor/tunnel.go
++++ b/supervisor/tunnel.go
+@@ -22,6 +22,7 @@ import (
+ 	cfdcrypto "github.com/cloudflare/cloudflared/crypto"
+ 	"github.com/cloudflare/cloudflared/edgediscovery"
+ 	"github.com/cloudflare/cloudflared/edgediscovery/allregions"
++	"github.com/cloudflare/cloudflared/edgeproxy"
+ 	"github.com/cloudflare/cloudflared/features"
+ 	"github.com/cloudflare/cloudflared/fips"
+ 	"github.com/cloudflare/cloudflared/ingress"
+@@ -48,6 +49,7 @@ type TunnelConfig struct {
+ 	Region             string
+ 	EdgeIPVersion      allregions.ConfigIPVersion
+ 	EdgeBindAddr       net.IP
++	EdgeProxyChain     *edgeproxy.Chain
+ 	HAConnections      int
+ 	IsAutoupdated      bool
+ 	LBPool             string
+@@ -496,7 +498,7 @@ func (e *EdgeTunnelServer) serveConnection(
+ 
+ 		connLog.Logger().Info().Msgf("Tunnel connection curve preferences: %v", tlsConfig.CurvePreferences)
+ 
+-		edgeConn, err := edgediscovery.DialEdge(ctx, dialTimeout, tlsConfig, addr.TCP, e.edgeBindAddr)
++		edgeConn, err := edgediscovery.DialEdgeWithProxy(ctx, dialTimeout, tlsConfig, addr.TCP, e.edgeBindAddr, e.config.EdgeProxyChain)
+ 		if err != nil {
+ 			// Parent cancellation is shutdown, not an edge connectivity failure.
+ 			// The caller will observe ctx.Err and stop without applying retry policy.
