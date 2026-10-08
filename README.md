@@ -12,7 +12,9 @@ cloudflared → proxy:8088 → TrueNAS Squid:3128 → Cloudflare edge:7844
 - [`cloudflared/`](cloudflared/README.md) contains a patch against pinned upstream
   source, build scripts, and client usage instructions.
 - [The build workflow](.github/workflows/build-cloudflared.yml) tests the patch
-  and creates Linux amd64 and arm64 tarballs and Debian packages with checksums.
+  and publishes Linux amd64 and arm64 binaries, tarballs, Debian packages, and
+  checksums to [GitHub Releases](https://github.com/glitchassassin/codex-cloud-config/releases/latest).
+  See the [cloud job download instructions](cloudflared/README.md#client-usage).
 
 The relay must have Internet access. The cloud environment needs a raw TCP grant
 for the relay's tailnet IPv4 address, and Tailscale policy must permit TCP 3128

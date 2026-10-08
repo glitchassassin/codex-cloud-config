@@ -69,3 +69,72 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 30
+
+  publish:
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: cloudflared-linux-*
+          path: dist
+          merge-multiple: true
+      - name: Publish verified packages to GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          source cloudflared/upstream.env
+          version="$UPSTREAM_VERSION-codex.$PATCH_REVISION"
+          tag="cloudflared-v$version-${GITHUB_SHA:0:12}"
+
+          # Keep complete archives/packages and add fixed binary names for jobs.
+          (
+            cd dist
+            for arch in amd64 arm64; do
+              sha256sum --check "SHA256SUMS-$arch.txt"
+              archive="cloudflared-$version-linux-$arch"
+              tar -xzf "$archive.tar.gz" --to-stdout "$archive/cloudflared" \
+                > "cloudflared-linux-$arch"
+              chmod 0755 "cloudflared-linux-$arch"
+            done
+            sha256sum cloudflared-linux-* *.tar.gz *.deb > SHA256SUMS.txt
+          )
+
+          # A delayed/manual run for an older main commit must not replace latest.
+          current_main=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
+          if [[ "$current_main" != "$GITHUB_SHA" ]]; then
+            echo "Skipping publication for an outdated main commit."
+            exit 0
+          fi
+
+          printf 'Patched cloudflared %s.\n\nUpstream commit: `%s`\nBuild configuration: `%s`\n\nIncludes Linux amd64/arm64 binaries, tarballs, Debian packages, and SHA256 checksums.\n' \
+            "$version" "$UPSTREAM_COMMIT" "$GITHUB_SHA" > "$RUNNER_TEMP/release-notes.md"
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft --jq .isDraft > "$RUNNER_TEMP/release-is-draft"; then
+            if [[ $(cat "$RUNNER_TEMP/release-is-draft") == false ]]; then
+              echo "Release $tag is already published; leaving its assets intact."
+              exit 0
+            fi
+          else
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" --draft --title "cloudflared $version" \
+              --notes-file "$RUNNER_TEMP/release-notes.md"
+          fi
+
+          # Resume interrupted uploads while the release is still a draft.
+          gh release upload "$tag" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          current_main=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
+          if [[ "$current_main" != "$GITHUB_SHA" ]]; then
+            echo "Main advanced during upload; leaving this release as a draft."
+            exit 0
+          fi
+          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false --latest
